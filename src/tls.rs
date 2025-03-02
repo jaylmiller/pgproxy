@@ -30,7 +30,8 @@ pub fn setup_client() -> TlsConnector {
             .with_root_certificates(client_root_store())
             .with_no_client_auth();
 
-    // conf.alpn_protocols = vec![b"postgresql".to_vec()];
+    conf.alpn_protocols = vec![b"postgresql".to_vec()];
+    conf.enable_sni = true;
     TlsConnector::from(Arc::new(conf))
 }
 

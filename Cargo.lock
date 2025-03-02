@@ -1803,6 +1803,7 @@ dependencies = [
  "pin-project",
  "pingora",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "structopt",

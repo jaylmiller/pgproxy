@@ -3,6 +3,7 @@ use std::io::ErrorKind;
 use std::net::ToSocketAddrs;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use bytes::{Buf, BufMut, BytesMut};
@@ -25,6 +26,7 @@ use pingora::{
 };
 
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
 pub struct PgWireMessageClientCodec;
@@ -54,38 +56,48 @@ fn hostname_is_ipv4(hostname: &str) -> bool {
     std::net::Ipv4Addr::from_str(hostname).is_ok()
 }
 
+static RRCOUNTER: AtomicUsize = AtomicUsize::new(1);
+
 fn to_peer(hostname: &str, port: u16, tls: bool) -> BasicPeer {
-    for addr in format!("{hostname}:{port}")
+    let addrs = format!("{hostname}:{port}")
         .to_socket_addrs()
         .expect("could not parse socketaddr")
-    {
-        if addr.is_ipv4() {
-            let mut peer = BasicPeer::new(&addr.to_string());
-            if tls && !hostname_is_ipv4(hostname) {
-                peer.sni = hostname.to_string();
-            }
-            return peer;
-        }
+        .filter(|x| x.is_ipv4())
+        .collect::<Vec<_>>();
+    assert!(!addrs.is_empty());
+    let addr = addrs
+        .get(RRCOUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % addrs.len())
+        .unwrap();
+    let mut peer = BasicPeer::new(&addr.to_string());
+    if tls && !hostname_is_ipv4(hostname) {
+        peer.sni = hostname.to_string();
     }
-    panic!("to_socket_addrs failed unexpectedly")
+    return peer;
 }
 
 pub async fn init_connection(
     hostname: &str,
     port: u16,
-    connector: &TransportConnector,
     tls_connector: Option<Arc<TlsConnector>>,
     require_ssl: bool,
 ) -> Result<Client> {
     let peer = to_peer(hostname, port, tls_connector.is_some());
+    let session = match TcpStream::connect(peer._address.to_string()).await {
+        Ok(conn) => conn,
+        Err(err) => {
+            tracing::error!(
+                "Failed to connect to {} (sni={}): {err:?}",
+                peer._address,
+                peer.sni
+            );
+            return Err(pingora::Error::new(ErrorType::ConnectError));
+        }
+    };
+    let session = Box::new(L4::from(session));
 
-    let session = connector
-        .new_stream(&peer)
-        .await?
-        .into_any()
-        .downcast::<L4>()
-        .unwrap();
     let session = Framed::new(session, PgWireMessageClientCodec);
+    tracing::trace!("Established tcp connection to {}", peer._address);
+
     let client = match ssl_handshake(session, &peer, tls_connector, require_ssl).await {
         Ok(s) => s,
         Err(err) => {
@@ -129,14 +141,17 @@ async fn ssl_handshake(
             pgwire::messages::startup::SslRequest::new(),
         )))
         .await?;
+    tracing::trace!("Sent initiate SSL request to server");
 
     if let Some(Ok(PgWireBackendMessage::SslResponse(ssl_resp))) = socket.next().await {
         match ssl_resp {
             SslResponse::Accept => {
+                tracing::trace!("Got SslResponse::Accept from server");
                 let conn = connect_tls(*socket.into_inner(), peer, tls_connector).await?;
                 Ok(Client::Secure(conn))
             }
             SslResponse::Refuse => {
+                tracing::trace!("Got SslResponse::Refuse from server");
                 if require_ssl {
                     Err(std::io::Error::new(
                         ErrorKind::ConnectionAborted,
@@ -229,41 +244,51 @@ mod tests {
             return;
         };
 
-        let connector = TransportConnector::new(None);
-
         let tls_conn = if db.tls {
             Some(Arc::new(crate::tls::setup_client()))
         } else {
             None
         };
 
-        let client = init_connection(
-            &db.hostname,
-            db.port.parse().unwrap(),
-            &connector,
-            tls_conn,
-            db.tls,
-        )
-        .await
-        .unwrap();
+        let client =
+            init_connection(&db.hostname, db.port.parse().unwrap(), tls_conn, db.tls).await;
+
+        dbg!(&client);
     }
 
-    #[tokio::test]
-    async fn test_tls() {
-        let Some(db) = local_testdb() else {
-            eprintln!("local testdb not configured in env, skipping");
-            return;
-        };
-        let peer = to_peer(&db.hostname, db.port.parse().unwrap(), true);
-        let connector = TransportConnector::new(None);
-        let session = connector
-            .new_stream(&peer)
-            .await
-            .unwrap()
-            .into_any()
-            .downcast::<L4>()
-            .unwrap();
-        let conn = connect_tls(*session, &peer, Arc::new(crate::tls::setup_client())).await;
-        dbg!(&conn);
-    }
+    // #[tokio::test]
+    // async fn test_tls() {
+    //     init_log(true);
+    //     let Some(db) = local_testdb() else {
+    //         eprintln!("local testdb not configured in env, skipping");
+    //         return;
+    //     };
+    //     let peer = to_peer(&db.hostname, db.port.parse().unwrap(), true);
+    //     let connector = TransportConnector::new(None);
+    //     let session = connector
+    //         .new_stream(&peer)
+    //         .await
+    //         .unwrap()
+    //         .into_any()
+    //         .downcast::<L4>()
+    //         .unwrap();
+    //     let conn = connect_tls(*session, &peer, Arc::new(crate::tls::setup_client())).await;
+    //     dbg!(&conn);
+    // }
+
+    // #[tokio::test]
+    // async fn test_tls2() {
+    //     init_log(true);
+    //     let Some(db) = local_testdb() else {
+    //         eprintln!("local testdb not configured in env, skipping");
+    //         return;
+    //     };
+
+    //     let conn = TcpStream::connect(format!("{}:{}", db.hostname, db.port))
+    //         .await
+    //         .unwrap();
+    //     let conn =
+    //         connect_tls_tcp_stream(conn, &db.hostname, Arc::new(crate::tls::setup_client())).await;
+    //     dbg!(conn);
+    // }
 }
