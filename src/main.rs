@@ -8,6 +8,7 @@ use structopt::StructOpt;
 use tracing_subscriber::EnvFilter;
 
 mod pg;
+mod pgclient;
 mod proxy;
 mod tls;
 
@@ -45,10 +46,12 @@ fn main() -> anyhow::Result<()> {
 
     server.bootstrap();
     let tls = tls::setup(&opts.cert_path, &opts.key_path)?;
+    let client_tls = tls::setup_client();
     let proxy_service = proxy::proxy_service(
         "0.0.0.0:5431", // listen
         "0.0.0.0:5433", // proxy to
         Arc::new(tls),
+        Arc::new(client_tls),
     );
     server.add_service(proxy_service);
 

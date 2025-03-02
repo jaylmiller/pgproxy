@@ -1,30 +1,36 @@
+use std::net::SocketAddr;
+
 use bytes::Buf;
-use futures::{SinkExt, StreamExt};
 use pgwire::{
     api::{ClientInfo, DefaultClient, PgWireConnectionState},
     error::PgWireError,
     messages::{
-        response::SslResponse,
         startup::{SslRequest, Startup},
         Message, PgWireBackendMessage, PgWireFrontendMessage,
     },
 };
-use pingora::protocols::{Stream, IO};
+use pingora::{
+    connectors::TransportConnector, tls::ClientTlsStream, upstreams::peer::BasicPeer, ErrorType,
+};
+use pingora::{
+    protocols::{l4::stream::Stream as L4, Peek},
+    Result,
+};
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
-pub struct PgWireMessageServerCodec<S> {
-    client_info: DefaultClient<S>,
+pub struct PgWireMessageServerCodec {
+    client_info: DefaultClient<()>,
 }
 
-impl<S> PgWireMessageServerCodec<S> {
-    pub fn new(client: DefaultClient<S>) -> Self {
+impl PgWireMessageServerCodec {
+    pub fn new(socket_addr: SocketAddr, is_secure: bool) -> Self {
         PgWireMessageServerCodec {
-            client_info: client,
+            client_info: DefaultClient::new(socket_addr, is_secure),
         }
     }
 }
 
-impl<S> Decoder for PgWireMessageServerCodec<S> {
+impl Decoder for PgWireMessageServerCodec {
     type Item = PgWireFrontendMessage;
     type Error = PgWireError;
 
@@ -38,8 +44,6 @@ impl<S> Decoder for PgWireMessageServerCodec<S> {
                     if let Some(request) = SslRequest::decode(src)? {
                         return Ok(Some(PgWireFrontendMessage::SslRequest(Some(request))));
                     } else {
-                        // this is not a real message, but to indicate that
-                        //  client will not init ssl handshake
                         return Ok(Some(PgWireFrontendMessage::SslRequest(None)));
                     }
                 }
@@ -60,7 +64,7 @@ impl<S> Decoder for PgWireMessageServerCodec<S> {
     }
 }
 
-impl<S> Encoder<PgWireBackendMessage> for PgWireMessageServerCodec<S> {
+impl Encoder<PgWireBackendMessage> for PgWireMessageServerCodec {
     type Error = std::io::Error;
 
     fn encode(
@@ -72,13 +76,6 @@ impl<S> Encoder<PgWireBackendMessage> for PgWireMessageServerCodec<S> {
     }
 }
 
-pub async fn check_ssl_direct_negotiation<I: IO>(socket: &mut I) -> Result<bool, std::io::Error> {
-    let mut buf = [0u8; 1];
-
-    let peeked = socket.try_peek(&mut buf).await?;
-    assert!(peeked, "try_peek returned false");
-    Ok(buf[0] == 0x16)
-}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SslNegotiationType {
@@ -87,36 +84,16 @@ pub enum SslNegotiationType {
     None,
 }
 
-pub async fn peek_for_sslrequest<S, I: IO>(
-    socket: &mut Framed<I, PgWireMessageServerCodec<S>>,
-) -> Result<SslNegotiationType, std::io::Error> {
-    if check_ssl_direct_negotiation(socket.get_mut()).await? {
-        Ok(SslNegotiationType::Direct)
-    } else if let Some(Ok(PgWireFrontendMessage::SslRequest(Some(_)))) = socket.next().await {
-        socket
-            .send(PgWireBackendMessage::SslResponse(SslResponse::Accept))
-            .await?;
-        Ok(SslNegotiationType::Postgres)
-    } else {
-        Ok(SslNegotiationType::None)
-    }
+pub async fn check_ssl_direct_negotiation(tcp_socket: &mut L4) -> Result<bool> {
+    let mut buf = [0u8; 1];
+
+    let peeked = match tcp_socket.try_peek(&mut buf).await {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::error!("Peeking next byte on tcp for ssl direct negotation failed: {err:?}");
+            return Err(pingora::Error::new(ErrorType::ReadError));
+        }
+    };
+    assert!(peeked, "try_peek returned false");
+    Ok(buf[0] == 0x16)
 }
-
-// fn setup_tls() -> Result<TlsAcceptor, IOError> {
-//     let cert = certs(&mut BufReader::new(File::open("examples/ssl/server.crt")?))
-//         .collect::<Result<Vec<CertificateDer>, IOError>>()?;
-
-//     let key = pkcs8_private_keys(&mut BufReader::new(File::open("examples/ssl/server.key")?))
-//         .map(|key| key.map(PrivateKeyDer::from))
-//         .collect::<Result<Vec<PrivateKeyDer>, IOError>>()?
-//         .remove(0);
-
-//     let mut config = ServerConfig::builder()
-//         .with_no_client_auth()
-//         .with_single_cert(cert, key)
-//         .map_err(|err| IOError::new(ErrorKind::InvalidInput, err))?;
-
-//     config.alpn_protocols = vec![b"postgresql".to_vec()];
-
-//     Ok(TlsAcceptor::from(Arc::new(config)))
-// }

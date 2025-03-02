@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use pgwire::api::DefaultClient;
+use pgwire::error::ErrorInfo;
 use pgwire::messages::response::SslResponse;
+use pgwire::messages::startup::Startup;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use tokio_util::codec::Framed;
 use tracing::debug;
@@ -16,44 +18,33 @@ use pingora::apps::ServerApp;
 
 use pingora::listeners::Listeners;
 use pingora::protocols::l4::stream::Stream as L4;
-use pingora::protocols::{Peek, Stream};
+use pingora::protocols::{GetSocketDigest, Peek, Stream};
 use pingora::server::ShutdownWatch;
 use pingora::services::listening::Service;
-use pingora::tls::{ServerTlsStream, TlsAcceptor};
+use pingora::tls::{ServerTlsStream, TlsAcceptor, TlsConnector};
 use pingora::upstreams::peer::BasicPeer;
 
-use crate::pg::{PgWireMessageServerCodec, SslNegotiationType};
+use crate::pg::{check_ssl_direct_negotiation, PgWireMessageServerCodec, SslNegotiationType};
 
-pub fn proxy_service(addr: &str, proxy_addr: &str, ssl: Arc<TlsAcceptor>) -> Service<ProxyApp> {
+pub fn proxy_service(
+    addr: &str,
+    proxy_addr: &str,
+    tls: Arc<TlsAcceptor>,
+    client_tls: Arc<TlsConnector>,
+) -> Service<ProxyApp> {
     let proxy_to = BasicPeer::new(proxy_addr);
 
     Service::with_listeners(
         "Proxy Service".to_string(),
         Listeners::tcp(addr),
-        ProxyApp::new(proxy_to, ssl),
+        ProxyApp::new(proxy_to, tls, client_tls),
     )
 }
-
-// pub fn proxy_service_tls(
-//     addr: &str,
-//     proxy_addr: &str,
-//     proxy_sni: &str,
-//     cert_path: &str,
-//     key_path: &str,
-// ) -> Service<ProxyApp> {
-//     let mut proxy_to = BasicPeer::new(proxy_addr);
-//     // set SNI to enable TLS
-//     proxy_to.sni = proxy_sni.into();
-//     Service::with_listeners(
-//         "Proxy Service TLS".to_string(),
-//         Listeners::tls(addr, cert_path, key_path).unwrap(),
-//         ProxyApp::new(proxy_to),
-//     )
-// }
 
 pub struct ProxyApp {
     proxy_to: BasicPeer,
     tls: Arc<TlsAcceptor>,
+    client_tls: Arc<TlsConnector>,
 }
 
 enum ProxyEvents {
@@ -62,11 +53,11 @@ enum ProxyEvents {
 }
 
 impl ProxyApp {
-    pub fn new(proxy_to: BasicPeer, tls: Arc<TlsAcceptor>) -> Self {
+    pub fn new(proxy_to: BasicPeer, tls: Arc<TlsAcceptor>, client_tls: Arc<TlsConnector>) -> Self {
         ProxyApp {
-            // client_connector: TransportConnector::new(None),
             proxy_to,
             tls,
+            client_tls,
         }
     }
 
@@ -115,39 +106,60 @@ impl ProxyApp {
         }
     }
 
-    async fn init_client_tls(
+    async fn init_downstream(
         &self,
         mut io: L4,
         socketaddr: SocketAddr,
-    ) -> anyhow::Result<ServerTlsStream<L4>> {
-        let client_info = DefaultClient::<()>::new(socketaddr, false);
-        let mut socket = Framed::new(&mut io, PgWireMessageServerCodec::new(client_info));
-        let ssl_req = {
-            let direct_negotiation = {
-                let mut buf = [0u8; 1];
+    ) -> anyhow::Result<(ServerTlsStream<L4>, Startup)> {
+        let mut socket = Framed::new(&mut io, PgWireMessageServerCodec::new(socketaddr, false));
 
-                let peeked = socket.get_mut().try_peek(&mut buf).await?;
-                assert!(peeked, "try_peek returned false");
-                buf[0] == 0x16
-            };
+        let ssl_neg = {
+            let direct_negotiation = check_ssl_direct_negotiation(socket.get_mut()).await?;
             if direct_negotiation {
-                anyhow::Ok(SslNegotiationType::Direct)
+                SslNegotiationType::Direct
             } else if let Some(Ok(PgWireFrontendMessage::SslRequest(Some(_)))) = socket.next().await
             {
                 socket
                     .send(PgWireBackendMessage::SslResponse(SslResponse::Accept))
                     .await?;
-                Ok(SslNegotiationType::Postgres)
+                SslNegotiationType::Postgres
             } else {
-                Ok(SslNegotiationType::None)
+                SslNegotiationType::None
             }
         };
 
-        tracing::info!("Ssl negotation for {socketaddr}: {ssl_req:?}");
+        tracing::info!("Ssl negotation for {socketaddr}: {ssl_neg:?}");
         drop(socket);
-        let res = self.tls.accept(io).await?;
-        Ok(res)
+        let tls_stream = self.tls.accept(io).await?;
+
+        let mut socket = Framed::new(tls_stream, PgWireMessageServerCodec::new(socketaddr, true));
+        let startup: Startup;
+        loop {
+            match socket.next().await {
+                Some(Ok(msg @ PgWireFrontendMessage::SslRequest(_))) => {
+                    tracing::debug!("Got ssl request message ({socketaddr}): {msg:?}");
+                }
+                Some(Ok(PgWireFrontendMessage::Startup(val))) => {
+                    startup = val;
+                    return Ok((socket.into_inner(), startup));
+                }
+                Some(Ok(msg)) => {
+                    anyhow::bail!("Got unexpected message during startup ({socketaddr}): {msg:?}");
+                }
+                Some(Err(err)) => {
+                    anyhow::bail!("Got protocol error during startup ({socketaddr}) : {err:?}");
+                }
+                None => {
+                    anyhow::bail!(
+                        "No message received after tls stream initialized ({socketaddr})"
+                    );
+                }
+            }
+        }
     }
+
+    /// Create a new connection to postgres server requests are being proxied to.
+    pub async fn init_upstream() {}
 }
 
 #[async_trait]
@@ -158,6 +170,7 @@ impl ServerApp for ProxyApp {
         _shutdown: &ShutdownWatch,
     ) -> Option<Stream> {
         let sockinfo = io.get_socket_digest().unwrap();
+
         let socketaddr = sockinfo
             .peer_addr()
             .expect("peer_addr should have value")
@@ -167,29 +180,17 @@ impl ServerApp for ProxyApp {
 
         let io: Box<L4> = io.into_any().downcast().unwrap();
 
-        let stream = match self.init_client_tls(*io, *socketaddr).await {
+        let (tls_stream, startup) = match self.init_downstream(*io, *socketaddr).await {
             Err(err) => {
                 tracing::error!("Handling startup failed ({socketaddr}): {err:?}");
-                panic!("{err:?}");
+                return None;
             }
             Ok(s) => s,
         };
 
-        dbg!(stream.get_ref().1.server_name());
+        dbg!(tls_stream.get_ref().1.server_name());
 
         None
-        // let client_session = self.client_connector.new_stream(&self.proxy_to).await;
-
-        // match client_session {
-        //     Ok(client_session) => {
-        //         self.proxy_streams(io, client_session).await;
-        //         None
-        //     }
-        //     Err(e) => {
-        //         debug!("Failed to create client session: {}", e);
-        //         None
-        //     }
-        // }
     }
 
     /// This callback will be called once after the service stops listening to its endpoints.
