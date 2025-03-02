@@ -4,6 +4,7 @@ use pgwire::api::{DefaultClient, PgWireConnectionState};
 use pgwire::messages::response::SslResponse;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pingora::protocols::tls::server::handshake;
+use pingora::protocols::tls::SslStream;
 use pingora::tls::ssl::SslAcceptor;
 use rustls_pemfile::certs;
 use tokio_rustls::TlsAcceptor;
@@ -19,8 +20,8 @@ use tokio::select;
 use pingora::apps::ServerApp;
 use pingora::connectors::TransportConnector;
 use pingora::listeners::Listeners;
-use pingora::protocols::l4::stream::Stream as TcpStream;
-use pingora::protocols::{Peek, Stream, IO};
+use pingora::protocols::l4::stream::Stream as L4;
+use pingora::protocols::{GetSocketDigest, Peek, Ssl, Stream, IO};
 use pingora::server::ShutdownWatch;
 use pingora::services::listening::Service;
 use pingora::upstreams::peer::BasicPeer;
@@ -120,11 +121,11 @@ impl ProxyApp {
         }
     }
 
-    async fn handle_startup(
+    async fn init_ssl_stream(
         &self,
-        mut io: TcpStream,
+        mut io: L4,
         socketaddr: SocketAddr,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SslStream<L4>> {
         let client_info = DefaultClient::<()>::new(socketaddr, false);
         let mut socket = Framed::new(&mut io, PgWireMessageServerCodec::new(client_info));
         let ssl_req = {
@@ -151,12 +152,7 @@ impl ProxyApp {
         tracing::info!("Ssl negotation for {socketaddr}: {ssl_req:?}");
         drop(socket);
 
-        // let mut dc = io.as_any();
-        // let tcpstream = dc.downcast_mut::<TcpStream>().unwrap();
-        // println!("downcast successfully");
-        let ssl = handshake(&self.ssl, io);
-
-        Ok(())
+        Ok(handshake(&self.ssl, io).await?)
     }
 }
 
@@ -164,7 +160,7 @@ impl ProxyApp {
 impl ServerApp for ProxyApp {
     async fn process_new(
         self: &Arc<Self>,
-        mut io: Stream,
+        io: Stream,
         _shutdown: &ShutdownWatch,
     ) -> Option<Stream> {
         let sockinfo = io.get_socket_digest().unwrap();
@@ -175,14 +171,19 @@ impl ServerApp for ProxyApp {
             .expect("should be inet socket");
         tracing::info!("Got new connection: peer_addr={}", socketaddr);
 
-        let mut dc = io.into_any();
-        let tcpstream = dc.downcast::<TcpStream>().unwrap();
-        println!("downcast success");
+        let io: Box<L4> = io.into_any().downcast().unwrap();
 
-        if let Err(err) = self.handle_startup(*tcpstream, *socketaddr).await {
-            tracing::error!("Handling startup failed ({socketaddr}): {err:?}");
-            panic!("{err:?}");
+        let stream = match self.init_ssl_stream(*io, *socketaddr).await {
+            Err(err) => {
+                tracing::error!("Handling startup failed ({socketaddr}): {err:?}");
+                panic!("{err:?}");
+            }
+            Ok(s) => s,
         };
+        dbg!(stream.get_socket_digest().unwrap());
+
+        dbg!(stream.ssl_digest().unwrap());
+        dbg!(stream.ssl());
 
         None
         // let client_session = self.client_connector.new_stream(&self.proxy_to).await;
