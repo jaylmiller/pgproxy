@@ -56,6 +56,7 @@ fn hostname_is_ipv4(hostname: &str) -> bool {
     std::net::Ipv4Addr::from_str(hostname).is_ok()
 }
 
+// counter for dns round robin load balancing
 static RRCOUNTER: AtomicUsize = AtomicUsize::new(1);
 
 fn to_peer(hostname: &str, port: u16, tls: bool) -> BasicPeer {
