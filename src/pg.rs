@@ -9,7 +9,7 @@ use pgwire::{
         Message, PgWireBackendMessage, PgWireFrontendMessage,
     },
 };
-use pingora::protocols::Stream;
+use pingora::protocols::{Stream, IO};
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
 pub struct PgWireMessageServerCodec<S> {
@@ -72,7 +72,7 @@ impl<S> Encoder<PgWireBackendMessage> for PgWireMessageServerCodec<S> {
     }
 }
 
-pub async fn check_ssl_direct_negotiation(socket: &mut Stream) -> Result<bool, std::io::Error> {
+pub async fn check_ssl_direct_negotiation<I: IO>(socket: &mut I) -> Result<bool, std::io::Error> {
     let mut buf = [0u8; 1];
 
     let peeked = socket.try_peek(&mut buf).await?;
@@ -87,8 +87,8 @@ pub enum SslNegotiationType {
     None,
 }
 
-pub async fn peek_for_sslrequest<S>(
-    socket: &mut Framed<Stream, PgWireMessageServerCodec<S>>,
+pub async fn peek_for_sslrequest<S, I: IO>(
+    socket: &mut Framed<I, PgWireMessageServerCodec<S>>,
 ) -> Result<SslNegotiationType, std::io::Error> {
     if check_ssl_direct_negotiation(socket.get_mut()).await? {
         Ok(SslNegotiationType::Direct)

@@ -20,7 +20,7 @@ use pingora::apps::ServerApp;
 use pingora::connectors::TransportConnector;
 use pingora::listeners::Listeners;
 use pingora::protocols::l4::stream::Stream as TcpStream;
-use pingora::protocols::{Stream, IO};
+use pingora::protocols::{Peek, Stream, IO};
 use pingora::server::ShutdownWatch;
 use pingora::services::listening::Service;
 use pingora::upstreams::peer::BasicPeer;
@@ -122,13 +122,20 @@ impl ProxyApp {
 
     async fn handle_startup(
         &self,
-        mut io: Stream,
+        mut io: TcpStream,
         socketaddr: SocketAddr,
-    ) -> anyhow::Result<Stream> {
+    ) -> anyhow::Result<()> {
         let client_info = DefaultClient::<()>::new(socketaddr, false);
         let mut socket = Framed::new(&mut io, PgWireMessageServerCodec::new(client_info));
         let ssl_req = {
-            if check_ssl_direct_negotiation(socket.get_mut()).await? {
+            let direct_negotiation = {
+                let mut buf = [0u8; 1];
+
+                let peeked = socket.get_mut().try_peek(&mut buf).await?;
+                assert!(peeked, "try_peek returned false");
+                buf[0] == 0x16
+            };
+            if direct_negotiation {
                 anyhow::Ok(SslNegotiationType::Direct)
             } else if let Some(Ok(PgWireFrontendMessage::SslRequest(Some(_)))) = socket.next().await
             {
@@ -144,14 +151,12 @@ impl ProxyApp {
         tracing::info!("Ssl negotation for {socketaddr}: {ssl_req:?}");
         drop(socket);
 
-        let any = io.into_any();
-        let tcpstream = any.downcast::<TcpStream>().unwrap();
         // let mut dc = io.as_any();
         // let tcpstream = dc.downcast_mut::<TcpStream>().unwrap();
         // println!("downcast successfully");
-        let ssl = handshake(&self.ssl, *tcpstream);
+        let ssl = handshake(&self.ssl, io);
 
-        Ok(io)
+        Ok(())
     }
 }
 
@@ -170,7 +175,11 @@ impl ServerApp for ProxyApp {
             .expect("should be inet socket");
         tracing::info!("Got new connection: peer_addr={}", socketaddr);
 
-        if let Err(err) = self.handle_startup(io, *socketaddr).await {
+        let mut dc = io.into_any();
+        let tcpstream = dc.downcast::<TcpStream>().unwrap();
+        println!("downcast success");
+
+        if let Err(err) = self.handle_startup(*tcpstream, *socketaddr).await {
             tracing::error!("Handling startup failed ({socketaddr}): {err:?}");
             panic!("{err:?}");
         };
