@@ -44,11 +44,11 @@ fn main() -> anyhow::Result<()> {
     );
 
     server.bootstrap();
-    let ssl = tls::setup_ssl(&opts.cert_path, &opts.key_path)?;
+    let tls = tls::setup(&opts.cert_path, &opts.key_path)?;
     let proxy_service = proxy::proxy_service(
         "0.0.0.0:5431", // listen
         "0.0.0.0:5433", // proxy to
-        Arc::new(ssl),
+        Arc::new(tls),
     );
     server.add_service(proxy_service);
 
