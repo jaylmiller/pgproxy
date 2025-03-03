@@ -35,6 +35,7 @@ impl Decoder for PgWireMessageServerCodec {
     type Error = PgWireError;
 
     fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        dbg!(&self.client_info.state);
         match self.client_info.state() {
             PgWireConnectionState::AwaitingSslRequest => {
                 if src.remaining() >= SslRequest::BODY_SIZE {
@@ -75,7 +76,6 @@ impl Encoder<PgWireBackendMessage> for PgWireMessageServerCodec {
         item.encode(dst).map_err(Into::into)
     }
 }
-
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SslNegotiationType {

@@ -1,48 +1,49 @@
+use anyhow::anyhow;
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
-use pgwire::api::DefaultClient;
-use pgwire::error::ErrorInfo;
 use pgwire::messages::response::SslResponse;
-use pgwire::messages::startup::Startup;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use tokio_util::codec::Framed;
-use tracing::debug;
 
 use core::net::SocketAddr;
 
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::select;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use pingora::apps::ServerApp;
 
 use pingora::listeners::Listeners;
 use pingora::protocols::l4::stream::Stream as L4;
-use pingora::protocols::{GetSocketDigest, Peek, Stream};
+use pingora::protocols::Stream;
 use pingora::server::ShutdownWatch;
 use pingora::services::listening::Service;
-use pingora::tls::{ServerTlsStream, TlsAcceptor, TlsConnector};
-use pingora::upstreams::peer::BasicPeer;
+use pingora::tls::{ClientTlsStream, ServerTlsStream, TlsAcceptor, TlsConnector};
 
-use crate::pg::{check_ssl_direct_negotiation, PgWireMessageServerCodec, SslNegotiationType};
+use crate::pg::PgWireMessageServerCodec;
 
 pub fn proxy_service(
     addr: &str,
-    proxy_addr: &str,
+    upstream: Upstream,
     tls: Arc<TlsAcceptor>,
     client_tls: Arc<TlsConnector>,
 ) -> Service<ProxyApp> {
-    let proxy_to = BasicPeer::new(proxy_addr);
-
     Service::with_listeners(
         "Proxy Service".to_string(),
         Listeners::tcp(addr),
-        ProxyApp::new(proxy_to, tls, client_tls),
+        ProxyApp::new(upstream, tls, client_tls),
     )
 }
 
+#[derive(Debug, Clone)]
+pub struct Upstream {
+    pub hostname: String,
+    pub port: u16,
+    /// Equivalent to sslmode=require queryparam
+    pub ssl: bool,
+}
+
 pub struct ProxyApp {
-    proxy_to: BasicPeer,
+    upstream: Upstream,
     tls: Arc<TlsAcceptor>,
     client_tls: Arc<TlsConnector>,
 }
@@ -52,55 +53,57 @@ enum ProxyEvents {
     UpstreamRead(usize),
 }
 
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
+impl AsyncReadWrite for L4 {}
+impl AsyncReadWrite for ClientTlsStream<L4> {}
+
 impl ProxyApp {
-    pub fn new(proxy_to: BasicPeer, tls: Arc<TlsAcceptor>, client_tls: Arc<TlsConnector>) -> Self {
+    pub fn new(upstream: Upstream, tls: Arc<TlsAcceptor>, client_tls: Arc<TlsConnector>) -> Self {
         ProxyApp {
-            proxy_to,
+            upstream,
             tls,
             client_tls,
         }
     }
 
-    // async fn handle_startup(&self, mut stream: Stream) {
-    //     let codec = PgWireMessageServerCodec::new();
-    //     let mut socket = Framed::new(&mut stream, codec);
-    //     todo!()
-    // }
-
-    /// Bidirectionaly proxy data between server_session and client_session.
-    /// I.e. any bytes read from server session get sent to client session and vice versa.
-    async fn proxy_streams(&self, mut server_session: Stream, mut client_session: Stream) {
+    /// Bidirectionaly proxy data between downstream and upstream
+    async fn proxy_streams(
+        &self,
+        mut downstream: ServerTlsStream<L4>,
+        upstream: crate::client::Client,
+    ) -> anyhow::Result<()> {
+        let mut upstream = match upstream {
+            crate::client::Client::Plain(stream) => Box::new(stream) as Box<dyn AsyncReadWrite>,
+            crate::client::Client::Secure(tls_stream) => Box::new(tls_stream),
+        };
         let mut upstream_buf = [0; 1024];
         let mut downstream_buf = [0; 1024];
         loop {
-            let downstream_read = server_session.read(&mut upstream_buf);
-            let upstream_read = client_session.read(&mut downstream_buf);
+            let downstream_read = downstream.read(&mut upstream_buf);
+            let upstream_read = upstream.read(&mut downstream_buf);
             let event: ProxyEvents;
-            select! {
+            tokio::select! {
                 n = downstream_read => event
-                    = ProxyEvents::DownstreamRead(n.unwrap()),
+                    = ProxyEvents::DownstreamRead(n?),
                 n = upstream_read => event
-                    = ProxyEvents::UpstreamRead(n.unwrap()),
+                    = ProxyEvents::UpstreamRead(n?),
             }
             match event {
                 ProxyEvents::DownstreamRead(0) => {
-                    debug!("downstream session closing");
-                    return;
+                    tracing::debug!("downstream session closing");
+                    return Ok(());
                 }
                 ProxyEvents::UpstreamRead(0) => {
-                    debug!("upstream session closing");
-                    return;
+                    tracing::debug!("upstream session closing");
+                    return Ok(());
                 }
                 ProxyEvents::DownstreamRead(n) => {
-                    client_session.write_all(&upstream_buf[0..n]).await.unwrap();
-                    client_session.flush().await.unwrap();
+                    upstream.write_all(&upstream_buf[0..n]).await.unwrap();
+                    upstream.flush().await.unwrap();
                 }
                 ProxyEvents::UpstreamRead(n) => {
-                    server_session
-                        .write_all(&downstream_buf[0..n])
-                        .await
-                        .unwrap();
-                    server_session.flush().await.unwrap();
+                    downstream.write_all(&downstream_buf[0..n]).await.unwrap();
+                    downstream.flush().await.unwrap();
                 }
             }
         }
@@ -110,56 +113,50 @@ impl ProxyApp {
         &self,
         mut io: L4,
         socketaddr: SocketAddr,
-    ) -> anyhow::Result<(ServerTlsStream<L4>, Startup)> {
-        let mut socket = Framed::new(&mut io, PgWireMessageServerCodec::new(socketaddr, false));
-
-        let ssl_neg = {
-            let direct_negotiation = check_ssl_direct_negotiation(socket.get_mut()).await?;
-            if direct_negotiation {
-                SslNegotiationType::Direct
-            } else if let Some(Ok(PgWireFrontendMessage::SslRequest(Some(_)))) = socket.next().await
-            {
-                socket
-                    .send(PgWireBackendMessage::SslResponse(SslResponse::Accept))
-                    .await?;
-                SslNegotiationType::Postgres
-            } else {
-                SslNegotiationType::None
+    ) -> anyhow::Result<ServerTlsStream<L4>> {
+        io.set_nodelay().unwrap();
+        let mut socket = Framed::new(io, PgWireMessageServerCodec::new(socketaddr, false));
+        match socket
+            .next()
+            .await
+            .ok_or_else(|| anyhow!("never received message"))??
+        {
+            PgWireFrontendMessage::SslRequest(Some(_)) => {
+                tracing::trace!("Got SslRequest message");
             }
-        };
-
-        tracing::info!("Ssl negotation for {socketaddr}: {ssl_neg:?}");
-        drop(socket);
-        let tls_stream = self.tls.accept(io).await?;
-
-        let mut socket = Framed::new(tls_stream, PgWireMessageServerCodec::new(socketaddr, true));
-        let startup: Startup;
-        loop {
-            match socket.next().await {
-                Some(Ok(msg @ PgWireFrontendMessage::SslRequest(_))) => {
-                    tracing::debug!("Got ssl request message ({socketaddr}): {msg:?}");
-                }
-                Some(Ok(PgWireFrontendMessage::Startup(val))) => {
-                    startup = val;
-                    return Ok((socket.into_inner(), startup));
-                }
-                Some(Ok(msg)) => {
-                    anyhow::bail!("Got unexpected message during startup ({socketaddr}): {msg:?}");
-                }
-                Some(Err(err)) => {
-                    anyhow::bail!("Got protocol error during startup ({socketaddr}) : {err:?}");
-                }
-                None => {
-                    anyhow::bail!(
-                        "No message received after tls stream initialized ({socketaddr})"
-                    );
-                }
+            other => {
+                anyhow::bail!("Got unexpected message: {other:?}");
             }
         }
+
+        socket
+            .send(PgWireBackendMessage::SslResponse(SslResponse::Accept))
+            .await?;
+        tracing::trace!("Sent SslResponse::Accept, upgrading conn now");
+
+        let tls_stream = self.tls.accept(socket.into_inner()).await?;
+        tracing::trace!("Opened upgraded TLS conn");
+        Ok(tls_stream)
     }
 
     /// Create a new connection to postgres server requests are being proxied to.
-    pub async fn init_upstream() {}
+    pub async fn init_upstream(
+        &self,
+        upstream: &Upstream,
+    ) -> pingora::Result<crate::client::Client> {
+        let tls_connector = if upstream.ssl {
+            Some(self.client_tls.clone())
+        } else {
+            None
+        };
+        crate::client::init_connection(
+            &upstream.hostname,
+            upstream.port,
+            tls_connector,
+            upstream.ssl,
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -179,26 +176,28 @@ impl ServerApp for ProxyApp {
         tracing::info!("Got new connection: peer_addr={}", socketaddr);
 
         let io: Box<L4> = io.into_any().downcast().unwrap();
-
-        let (tls_stream, startup) = match self.init_downstream(*io, *socketaddr).await {
+        let downstream = match self.init_downstream(*io, *socketaddr).await {
+            Ok(v) => v,
             Err(err) => {
-                tracing::error!("Handling startup failed ({socketaddr}): {err:?}");
+                tracing::error!("Failed to initialize the downstream session: {err:?}");
                 return None;
             }
-            Ok(s) => s,
+        };
+        let upstream = match self.init_upstream(&self.upstream).await {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::error!("Failed to initialize the upstream session: {err:?}");
+                return None;
+            }
         };
 
-        dbg!(tls_stream.get_ref().1.server_name());
+        if let Err(err) = self.proxy_streams(downstream, upstream).await {
+            tracing::error!("Proxy failed: {err:?}");
+        }
 
         None
     }
 
     /// This callback will be called once after the service stops listening to its endpoints.
-    async fn cleanup(&self) {
-        tracing::info!(
-            "Cleaning up connection: addr={}, sni={}",
-            self.proxy_to._address,
-            self.proxy_to.sni
-        );
-    }
+    async fn cleanup(&self) {}
 }

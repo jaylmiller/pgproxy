@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
+use client::init_connection;
 use pingora::{
     prelude::Opt,
     server::{configuration::ServerConf, Server},
 };
+use proxy::Upstream;
 use structopt::StructOpt;
 use tracing_subscriber::EnvFilter;
 
+mod client;
 mod pg;
-mod pgclient;
 mod proxy;
 mod tls;
 
@@ -24,12 +26,37 @@ struct CustomOpts {
     /// Output logs human readable instead of json (for dev)
     #[structopt(long, env)]
     pretty_logs: bool,
+
+    #[structopt(long, env)]
+    test_client: bool,
+}
+
+async fn test_client() -> anyhow::Result<()> {
+    let conn = init_connection(
+        "localhost",
+        5433,
+        Some(Arc::new(tls::setup_client())),
+        false,
+    )
+    .await?;
+    dbg!(conn);
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
     load_env_files();
     let opts = CustomOpts::from_args();
     init_log(opts.pretty_logs);
+    if opts.test_client {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed building the Runtime")
+            .block_on(test_client())
+            .unwrap();
+        return Ok(());
+    }
+
     let mut server = Server::new_with_opt_and_conf(
         Opt {
             conf: None,
@@ -47,9 +74,16 @@ fn main() -> anyhow::Result<()> {
     server.bootstrap();
     let tls = tls::setup(&opts.cert_path, &opts.key_path)?;
     let client_tls = tls::setup_client();
+
+    let upstream = Upstream {
+        hostname: "127.0.0.1".to_string(),
+        port: 5433,
+        ssl: false,
+    };
+
     let proxy_service = proxy::proxy_service(
         "0.0.0.0:5431", // listen
-        "0.0.0.0:5433", // proxy to
+        upstream,
         Arc::new(tls),
         Arc::new(client_tls),
     );

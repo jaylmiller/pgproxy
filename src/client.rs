@@ -1,31 +1,17 @@
-use std::any::Any;
+use futures::SinkExt;
+use pgwire::error::PgWireError;
+use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use std::io::ErrorKind;
 use std::net::ToSocketAddrs;
-use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use bytes::{Buf, BufMut, BytesMut};
-use futures::{SinkExt, StreamExt};
-// adapted code from https://github.com/sunng87/pgwire/blob/aad3de9c909560c87e4f49760d565a6f1f4b8aa5/src/tokio/client.rs
-use pgwire::error::{PgWireError, PgWireResult};
-use pgwire::messages::response::SslResponse;
-use pgwire::messages::startup::SslRequest;
-use pgwire::messages::{self, startup, Message, PgWireBackendMessage, PgWireFrontendMessage};
-use pin_project::pin_project;
-
-use pingora::protocols::IO;
 use pingora::tls::{ServerName, TlsConnector};
-use pingora::{
-    connectors::TransportConnector, tls::ClientTlsStream, upstreams::peer::BasicPeer, ErrorType,
-};
-use pingora::{
-    protocols::{l4::stream::Stream as L4, Peek},
-    Result,
-};
+use pingora::{protocols::l4::stream::Stream as L4, Result};
+use pingora::{tls::ClientTlsStream, upstreams::peer::BasicPeer, ErrorType};
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
@@ -94,10 +80,10 @@ pub async fn init_connection(
             return Err(pingora::Error::new(ErrorType::ConnectError));
         }
     };
-    let session = Box::new(L4::from(session));
-
-    let session = Framed::new(session, PgWireMessageClientCodec);
     tracing::trace!("Established tcp connection to {}", peer._address);
+
+    let session = Box::new(L4::from(session));
+    let session = Framed::new(session, PgWireMessageClientCodec);
 
     let client = match ssl_handshake(session, &peer, tls_connector, require_ssl).await {
         Ok(s) => s,
@@ -142,34 +128,30 @@ async fn ssl_handshake(
             pgwire::messages::startup::SslRequest::new(),
         )))
         .await?;
-    tracing::trace!("Sent initiate SSL request to server");
-
-    if let Some(Ok(PgWireBackendMessage::SslResponse(ssl_resp))) = socket.next().await {
-        match ssl_resp {
-            SslResponse::Accept => {
-                tracing::trace!("Got SslResponse::Accept from server");
-                let conn = connect_tls(*socket.into_inner(), peer, tls_connector).await?;
-                Ok(Client::Secure(conn))
-            }
-            SslResponse::Refuse => {
-                tracing::trace!("Got SslResponse::Refuse from server");
-                if require_ssl {
-                    Err(std::io::Error::new(
-                        ErrorKind::ConnectionAborted,
-                        "TLS is not enabled on server but client specified it must be required",
-                    ))
-                } else {
-                    Ok(Client::Plain(*socket.into_inner()))
-                }
-            }
-            _ => unreachable!(),
+    let mut response = [0u8; 1];
+    socket.get_mut().read_exact(&mut response).await?;
+    match response[0] {
+        b'S' => {
+            tracing::trace!("Got SslResponse::Accept from server");
+            let conn = connect_tls(*socket.into_inner(), peer, tls_connector).await?;
+            tracing::trace!("Successfully upgraded to TLS connection");
+            Ok(Client::Secure(conn))
         }
-    } else {
-        // connection closed
-        Err(std::io::Error::new(
-            ErrorKind::ConnectionAborted,
-            "Expect SslResponse",
-        ))
+        b'N' => {
+            tracing::trace!("Got Ssl refusal from server (N byte)");
+            if require_ssl {
+                Err(std::io::Error::new(
+                    ErrorKind::ConnectionAborted,
+                    "TLS is not enabled on server but client specified it must be required",
+                ))
+            } else {
+                Ok(Client::Plain(*socket.into_inner()))
+            }
+        }
+        other => Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!("Unexpected SSL response byte: {}", other),
+        )),
     }
 }
 
