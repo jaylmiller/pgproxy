@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use client::init_connection;
@@ -10,6 +11,7 @@ use structopt::StructOpt;
 use tracing_subscriber::EnvFilter;
 
 mod client;
+mod config;
 mod pg;
 mod proxy;
 mod tls;
@@ -29,6 +31,11 @@ struct CustomOpts {
 
     #[structopt(long, env)]
     test_client: bool,
+
+    /// Path to a JSON config file that maps SNI hostnames to backend servers.
+    /// When provided, the proxy routes connections based on the SNI in the TLS handshake.
+    #[structopt(long, env = "CONFIG_PATH")]
+    config: Option<String>,
 }
 
 async fn test_client() -> anyhow::Result<()> {
@@ -75,15 +82,38 @@ fn main() -> anyhow::Result<()> {
     let tls = tls::setup(&opts.cert_path, &opts.key_path)?;
     let client_tls = tls::setup_client();
 
-    let upstream = Upstream {
-        hostname: "127.0.0.1".to_string(),
-        port: 5433,
-        ssl: false,
+    let (listen_addr, upstreams, default_upstream) = if let Some(config_path) = &opts.config {
+        let proxy_config = config::ProxyConfig::from_file(config_path)?;
+        let listen = proxy_config
+            .listen
+            .clone()
+            .unwrap_or_else(|| "0.0.0.0:5431".to_string());
+        let (map, default) = proxy_config.into_upstream_map();
+        tracing::info!(
+            listen = %listen,
+            backends = map.len(),
+            has_default = default.is_some(),
+            "Loaded SNI routing config"
+        );
+        for (sni, upstream) in &map {
+            tracing::info!(sni, hostname = %upstream.hostname, port = upstream.port, ssl = upstream.ssl, "Registered backend");
+        }
+        (listen, map, default)
+    } else {
+        // Backwards-compatible: single upstream at 127.0.0.1:5433
+        let map = HashMap::new();
+        let upstream = Upstream {
+            hostname: "127.0.0.1".to_string(),
+            port: 5433,
+            ssl: false,
+        };
+        ("0.0.0.0:5431".to_string(), map, Some(upstream))
     };
 
     let proxy_service = proxy::proxy_service(
-        "0.0.0.0:5431", // listen
-        upstream,
+        &listen_addr,
+        upstreams,
+        default_upstream,
         Arc::new(tls),
         Arc::new(client_tls),
     );
