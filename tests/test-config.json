@@ -1,0 +1,17 @@
+{
+  "listen": "0.0.0.0:15431",
+  "backends": [
+    {
+      "sni": "db1.db.local",
+      "hostname": "127.0.0.1",
+      "port": 15432,
+      "ssl": false
+    },
+    {
+      "sni": "db2.db.local",
+      "hostname": "127.0.0.1",
+      "port": 15433,
+      "ssl": false
+    }
+  ]
+}
