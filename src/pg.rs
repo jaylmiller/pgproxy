@@ -35,7 +35,7 @@ impl Decoder for PgWireMessageServerCodec {
     type Error = PgWireError;
 
     fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        dbg!(&self.client_info.state);
+        tracing::trace!(state = ?self.client_info.state(), "decoding frontend message");
         match self.client_info.state() {
             PgWireConnectionState::AwaitingSslRequest => {
                 if src.remaining() >= SslRequest::BODY_SIZE {
@@ -94,6 +94,9 @@ pub async fn check_ssl_direct_negotiation(tcp_socket: &mut L4) -> Result<bool> {
             return Err(pingora::Error::new(ErrorType::ReadError));
         }
     };
-    assert!(peeked, "try_peek returned false");
+    if !peeked {
+        tracing::error!("try_peek returned false during SSL direct negotiation check");
+        return Err(pingora::Error::new(ErrorType::ReadError));
+    }
     Ok(buf[0] == 0x16)
 }
