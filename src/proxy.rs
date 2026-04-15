@@ -98,12 +98,12 @@ impl ProxyApp {
                     return Ok(());
                 }
                 ProxyEvents::DownstreamRead(n) => {
-                    upstream.write_all(&upstream_buf[0..n]).await.unwrap();
-                    upstream.flush().await.unwrap();
+                    upstream.write_all(&upstream_buf[0..n]).await?;
+                    upstream.flush().await?;
                 }
                 ProxyEvents::UpstreamRead(n) => {
-                    downstream.write_all(&downstream_buf[0..n]).await.unwrap();
-                    downstream.flush().await.unwrap();
+                    downstream.write_all(&downstream_buf[0..n]).await?;
+                    downstream.flush().await?;
                 }
             }
         }
@@ -114,7 +114,8 @@ impl ProxyApp {
         mut io: L4,
         socketaddr: SocketAddr,
     ) -> anyhow::Result<ServerTlsStream<L4>> {
-        io.set_nodelay().unwrap();
+        io.set_nodelay()
+            .map_err(|e| anyhow!("failed to set TCP_NODELAY: {e}"))?;
         let mut socket = Framed::new(io, PgWireMessageServerCodec::new(socketaddr, false));
         match socket
             .next()

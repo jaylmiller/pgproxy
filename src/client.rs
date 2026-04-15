@@ -45,21 +45,25 @@ fn hostname_is_ipv4(hostname: &str) -> bool {
 // counter for dns round robin load balancing
 static RRCOUNTER: AtomicUsize = AtomicUsize::new(1);
 
-fn to_peer(hostname: &str, port: u16, tls: bool) -> BasicPeer {
+fn to_peer(hostname: &str, port: u16, tls: bool) -> Result<BasicPeer> {
     let addrs = format!("{hostname}:{port}")
         .to_socket_addrs()
-        .expect("could not parse socketaddr")
+        .map_err(|e| {
+            tracing::error!("could not resolve {hostname}:{port}: {e}");
+            pingora::Error::new(ErrorType::ConnectError)
+        })?
         .filter(|x| x.is_ipv4())
         .collect::<Vec<_>>();
-    assert!(!addrs.is_empty());
-    let addr = addrs
-        .get(RRCOUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % addrs.len())
-        .unwrap();
+    if addrs.is_empty() {
+        tracing::error!("no IPv4 addresses found for {hostname}:{port}");
+        return Err(pingora::Error::new(ErrorType::ConnectError));
+    }
+    let addr = &addrs[RRCOUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % addrs.len()];
     let mut peer = BasicPeer::new(&addr.to_string());
     if tls && !hostname_is_ipv4(hostname) {
         peer.sni = hostname.to_string();
     }
-    return peer;
+    Ok(peer)
 }
 
 pub async fn init_connection(
@@ -68,7 +72,7 @@ pub async fn init_connection(
     tls_connector: Option<Arc<TlsConnector>>,
     require_ssl: bool,
 ) -> Result<Client> {
-    let peer = to_peer(hostname, port, tls_connector.is_some());
+    let peer = to_peer(hostname, port, tls_connector.is_some())?;
     let session = match TcpStream::connect(peer._address.to_string()).await {
         Ok(conn) => conn,
         Err(err) => {
@@ -199,23 +203,12 @@ mod tests {
         })
     }
 
-    // // https://rnacentral.org/help/public-database
-    // fn public_db() -> TestDbConn {
-    //     TestDbConn {
-    //         port: "5432".to_string(),
-    //         username: "reader".to_string(),
-    //         pw: "NWDMCE5xdipIjRrp".to_string(),
-    //         hostname: "hh-pgsql-public.ebi.ac.uk".to_string(),
-    //         db: "pfmegrnargs".to_string(),
-    //         tls: false,
-    //     }
-    // }
 
     #[test]
     fn test_to_peer() {
-        let peer = to_peer("localhost", 5433, false);
+        let _peer = to_peer("localhost", 5433, false).unwrap();
 
-        let peer = to_peer("localhost", 5433, true);
+        let peer = to_peer("localhost", 5433, true).unwrap();
         assert_eq!(peer.sni, "localhost");
     }
 

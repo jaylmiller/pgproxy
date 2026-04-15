@@ -29,6 +29,22 @@ struct CustomOpts {
 
     #[structopt(long, env)]
     test_client: bool,
+
+    /// Address to listen on
+    #[structopt(long, env, default_value = "0.0.0.0:5431")]
+    listen_addr: String,
+
+    /// Upstream PostgreSQL hostname
+    #[structopt(long, env, default_value = "127.0.0.1")]
+    upstream_host: String,
+
+    /// Upstream PostgreSQL port
+    #[structopt(long, env, default_value = "5433")]
+    upstream_port: u16,
+
+    /// Require SSL for upstream connection
+    #[structopt(long, env)]
+    upstream_ssl: bool,
 }
 
 async fn test_client() -> anyhow::Result<()> {
@@ -76,13 +92,13 @@ fn main() -> anyhow::Result<()> {
     let client_tls = tls::setup_client();
 
     let upstream = Upstream {
-        hostname: "127.0.0.1".to_string(),
-        port: 5433,
-        ssl: false,
+        hostname: opts.upstream_host,
+        port: opts.upstream_port,
+        ssl: opts.upstream_ssl,
     };
 
     let proxy_service = proxy::proxy_service(
-        "0.0.0.0:5431", // listen
+        &opts.listen_addr,
         upstream,
         Arc::new(tls),
         Arc::new(client_tls),

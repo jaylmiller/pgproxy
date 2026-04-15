@@ -1,2 +1,6 @@
 target/
 .env.local
+
+# Private keys — regenerate with local-certs/*/gen.sh
+local-certs/ca/ca.key
+local-certs/server/key.pem
