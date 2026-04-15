@@ -5,12 +5,12 @@ use pingora::{
     prelude::Opt,
     server::{configuration::ServerConf, Server},
 };
-use proxy::Upstream;
 use structopt::StructOpt;
 use tracing_subscriber::EnvFilter;
 
 mod client;
 mod pg;
+mod pool;
 mod proxy;
 mod tls;
 
@@ -29,6 +29,14 @@ struct CustomOpts {
 
     #[structopt(long, env)]
     test_client: bool,
+
+    /// Maximum number of connections in the upstream connection pool
+    #[structopt(long, env, default_value = "10")]
+    pool_size: u32,
+
+    /// Timeout in seconds for acquiring a connection from the pool
+    #[structopt(long, env, default_value = "30")]
+    pool_connection_timeout: u64,
 }
 
 async fn test_client() -> anyhow::Result<()> {
@@ -75,17 +83,22 @@ fn main() -> anyhow::Result<()> {
     let tls = tls::setup(&opts.cert_path, &opts.key_path)?;
     let client_tls = tls::setup_client();
 
-    let upstream = Upstream {
+    let upstream = proxy::Upstream {
         hostname: "127.0.0.1".to_string(),
         port: 5433,
         ssl: false,
     };
 
+    let manager = pool::PgConnectionManager::new(upstream, Arc::new(client_tls));
+    let pool = bb8::Pool::builder()
+        .max_size(opts.pool_size)
+        .connection_timeout(std::time::Duration::from_secs(opts.pool_connection_timeout))
+        .build_unchecked(manager);
+
     let proxy_service = proxy::proxy_service(
         "0.0.0.0:5431", // listen
-        upstream,
         Arc::new(tls),
-        Arc::new(client_tls),
+        pool,
     );
     server.add_service(proxy_service);
 

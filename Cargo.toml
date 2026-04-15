@@ -30,6 +30,7 @@ pgwire = {version="0.28.0"}
 pin-project = { version = "1.1" }
 tokio-util = { version = "0.7.3", features = ["codec", "io"] }
 rustls = "0.23.23"
+bb8 = "0.8"
 
 
 

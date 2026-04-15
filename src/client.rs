@@ -1,17 +1,18 @@
-use futures::SinkExt;
-use pgwire::error::PgWireError;
-use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use std::io::ErrorKind;
 use std::net::ToSocketAddrs;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
+use futures::SinkExt;
+use pgwire::error::PgWireError;
+use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pingora::tls::{ServerName, TlsConnector};
 use pingora::{protocols::l4::stream::Stream as L4, Result};
 use pingora::{tls::ClientTlsStream, upstreams::peer::BasicPeer, ErrorType};
-
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
@@ -99,6 +100,46 @@ pub async fn init_connection(
 pub enum Client {
     Plain(L4),
     Secure(ClientTlsStream<L4>),
+}
+
+impl AsyncRead for Client {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Client::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Client::Secure(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Client {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Client::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Client::Secure(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Client::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Client::Secure(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Client::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Client::Secure(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
 }
 
 async fn connect_tls(

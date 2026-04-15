@@ -8,7 +8,7 @@ use tokio_util::codec::Framed;
 use core::net::SocketAddr;
 
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use pingora::apps::ServerApp;
 
@@ -17,20 +17,20 @@ use pingora::protocols::l4::stream::Stream as L4;
 use pingora::protocols::Stream;
 use pingora::server::ShutdownWatch;
 use pingora::services::listening::Service;
-use pingora::tls::{ClientTlsStream, ServerTlsStream, TlsAcceptor, TlsConnector};
+use pingora::tls::{ServerTlsStream, TlsAcceptor};
 
 use crate::pg::PgWireMessageServerCodec;
+use crate::pool::PgConnectionManager;
 
 pub fn proxy_service(
     addr: &str,
-    upstream: Upstream,
     tls: Arc<TlsAcceptor>,
-    client_tls: Arc<TlsConnector>,
+    pool: bb8::Pool<PgConnectionManager>,
 ) -> Service<ProxyApp> {
     Service::with_listeners(
         "Proxy Service".to_string(),
         Listeners::tcp(addr),
-        ProxyApp::new(upstream, tls, client_tls),
+        ProxyApp::new(tls, pool),
     )
 }
 
@@ -43,9 +43,8 @@ pub struct Upstream {
 }
 
 pub struct ProxyApp {
-    upstream: Upstream,
     tls: Arc<TlsAcceptor>,
-    client_tls: Arc<TlsConnector>,
+    pool: bb8::Pool<PgConnectionManager>,
 }
 
 enum ProxyEvents {
@@ -53,29 +52,17 @@ enum ProxyEvents {
     UpstreamRead(usize),
 }
 
-trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
-impl AsyncReadWrite for L4 {}
-impl AsyncReadWrite for ClientTlsStream<L4> {}
-
 impl ProxyApp {
-    pub fn new(upstream: Upstream, tls: Arc<TlsAcceptor>, client_tls: Arc<TlsConnector>) -> Self {
-        ProxyApp {
-            upstream,
-            tls,
-            client_tls,
-        }
+    pub fn new(tls: Arc<TlsAcceptor>, pool: bb8::Pool<PgConnectionManager>) -> Self {
+        ProxyApp { tls, pool }
     }
 
     /// Bidirectionaly proxy data between downstream and upstream
     async fn proxy_streams(
         &self,
         mut downstream: ServerTlsStream<L4>,
-        upstream: crate::client::Client,
+        upstream: &mut crate::client::Client,
     ) -> anyhow::Result<()> {
-        let mut upstream = match upstream {
-            crate::client::Client::Plain(stream) => Box::new(stream) as Box<dyn AsyncReadWrite>,
-            crate::client::Client::Secure(tls_stream) => Box::new(tls_stream),
-        };
         let mut upstream_buf = [0; 1024];
         let mut downstream_buf = [0; 1024];
         loop {
@@ -139,24 +126,6 @@ impl ProxyApp {
         Ok(tls_stream)
     }
 
-    /// Create a new connection to postgres server requests are being proxied to.
-    pub async fn init_upstream(
-        &self,
-        upstream: &Upstream,
-    ) -> pingora::Result<crate::client::Client> {
-        let tls_connector = if upstream.ssl {
-            Some(self.client_tls.clone())
-        } else {
-            None
-        };
-        crate::client::init_connection(
-            &upstream.hostname,
-            upstream.port,
-            tls_connector,
-            upstream.ssl,
-        )
-        .await
-    }
 }
 
 #[async_trait]
@@ -183,15 +152,15 @@ impl ServerApp for ProxyApp {
                 return None;
             }
         };
-        let upstream = match self.init_upstream(&self.upstream).await {
+        let mut upstream = match self.pool.get().await {
             Ok(v) => v,
             Err(err) => {
-                tracing::error!("Failed to initialize the upstream session: {err:?}");
+                tracing::error!("Failed to get upstream connection from pool: {err:?}");
                 return None;
             }
         };
 
-        if let Err(err) = self.proxy_streams(downstream, upstream).await {
+        if let Err(err) = self.proxy_streams(downstream, &mut *upstream).await {
             tracing::error!("Proxy failed: {err:?}");
         }
 
