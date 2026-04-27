@@ -6,6 +6,7 @@ use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use tokio_util::codec::Framed;
 
 use core::net::SocketAddr;
+use std::collections::HashMap;
 
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -23,14 +24,15 @@ use crate::pg::PgWireMessageServerCodec;
 
 pub fn proxy_service(
     addr: &str,
-    upstream: Upstream,
+    upstreams: HashMap<String, Upstream>,
+    default_upstream: Option<Upstream>,
     tls: Arc<TlsAcceptor>,
     client_tls: Arc<TlsConnector>,
 ) -> Service<ProxyApp> {
     Service::with_listeners(
         "Proxy Service".to_string(),
         Listeners::tcp(addr),
-        ProxyApp::new(upstream, tls, client_tls),
+        ProxyApp::new(upstreams, default_upstream, tls, client_tls),
     )
 }
 
@@ -43,7 +45,8 @@ pub struct Upstream {
 }
 
 pub struct ProxyApp {
-    upstream: Upstream,
+    upstreams: HashMap<String, Upstream>,
+    default_upstream: Option<Upstream>,
     tls: Arc<TlsAcceptor>,
     client_tls: Arc<TlsConnector>,
 }
@@ -58,12 +61,33 @@ impl AsyncReadWrite for L4 {}
 impl AsyncReadWrite for ClientTlsStream<L4> {}
 
 impl ProxyApp {
-    pub fn new(upstream: Upstream, tls: Arc<TlsAcceptor>, client_tls: Arc<TlsConnector>) -> Self {
+    pub fn new(
+        upstreams: HashMap<String, Upstream>,
+        default_upstream: Option<Upstream>,
+        tls: Arc<TlsAcceptor>,
+        client_tls: Arc<TlsConnector>,
+    ) -> Self {
         ProxyApp {
-            upstream,
+            upstreams,
+            default_upstream,
             tls,
             client_tls,
         }
+    }
+
+    /// Look up the upstream backend based on the SNI from the client's TLS handshake.
+    /// Falls back to the default upstream if no SNI match is found.
+    fn resolve_upstream(&self, sni: Option<&str>) -> Option<&Upstream> {
+        if let Some(sni) = sni {
+            if let Some(upstream) = self.upstreams.get(sni) {
+                tracing::info!(sni, "Resolved upstream via SNI");
+                return Some(upstream);
+            }
+            tracing::warn!(sni, "No upstream configured for SNI, trying default");
+        } else {
+            tracing::warn!("No SNI provided by client, trying default");
+        }
+        self.default_upstream.as_ref()
     }
 
     /// Bidirectionaly proxy data between downstream and upstream
@@ -109,11 +133,13 @@ impl ProxyApp {
         }
     }
 
+    /// Initialize the downstream (client-facing) TLS connection.
+    /// Returns the TLS stream and the SNI hostname extracted from the handshake.
     async fn init_downstream(
         &self,
         mut io: L4,
         socketaddr: SocketAddr,
-    ) -> anyhow::Result<ServerTlsStream<L4>> {
+    ) -> anyhow::Result<(ServerTlsStream<L4>, Option<String>)> {
         io.set_nodelay().unwrap();
         let mut socket = Framed::new(io, PgWireMessageServerCodec::new(socketaddr, false));
         match socket
@@ -135,8 +161,13 @@ impl ProxyApp {
         tracing::trace!("Sent SslResponse::Accept, upgrading conn now");
 
         let tls_stream = self.tls.accept(socket.into_inner()).await?;
-        tracing::trace!("Opened upgraded TLS conn");
-        Ok(tls_stream)
+        let sni = tls_stream
+            .get_ref()
+            .1
+            .server_name()
+            .map(|s| s.to_string());
+        tracing::info!(sni = ?sni, "Opened upgraded TLS conn");
+        Ok((tls_stream, sni))
     }
 
     /// Create a new connection to postgres server requests are being proxied to.
@@ -176,14 +207,23 @@ impl ServerApp for ProxyApp {
         tracing::info!("Got new connection: peer_addr={}", socketaddr);
 
         let io: Box<L4> = io.into_any().downcast().unwrap();
-        let downstream = match self.init_downstream(*io, *socketaddr).await {
+        let (downstream, sni) = match self.init_downstream(*io, *socketaddr).await {
             Ok(v) => v,
             Err(err) => {
                 tracing::error!("Failed to initialize the downstream session: {err:?}");
                 return None;
             }
         };
-        let upstream = match self.init_upstream(&self.upstream).await {
+
+        let upstream_config = match self.resolve_upstream(sni.as_deref()) {
+            Some(u) => u,
+            None => {
+                tracing::error!(sni = ?sni, "No upstream backend found for SNI and no default configured");
+                return None;
+            }
+        };
+
+        let upstream = match self.init_upstream(upstream_config).await {
             Ok(v) => v,
             Err(err) => {
                 tracing::error!("Failed to initialize the upstream session: {err:?}");

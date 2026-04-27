@@ -1,0 +1,22 @@
+{
+  "listen": "0.0.0.0:5431",
+  "backends": [
+    {
+      "sni": "db1.example.com",
+      "hostname": "10.0.0.1",
+      "port": 5432,
+      "ssl": false
+    },
+    {
+      "sni": "db2.example.com",
+      "hostname": "10.0.0.2",
+      "port": 5432,
+      "ssl": true
+    }
+  ],
+  "default_backend": {
+    "hostname": "127.0.0.1",
+    "port": 5432,
+    "ssl": false
+  }
+}
