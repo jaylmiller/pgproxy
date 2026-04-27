@@ -28,3 +28,18 @@ services:
       interval: 2s
       timeout: 5s
       retries: 10
+
+  pg3:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "15434:5432"
+    volumes:
+      - ./init/pg3.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10

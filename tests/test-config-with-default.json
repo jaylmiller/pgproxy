@@ -12,12 +12,11 @@
       "hostname": "127.0.0.1",
       "port": 15433,
       "ssl": false
-    },
-    {
-      "sni": "db3.db.local",
-      "hostname": "127.0.0.1",
-      "port": 15434,
-      "ssl": false
     }
-  ]
+  ],
+  "default_backend": {
+    "hostname": "127.0.0.1",
+    "port": 15434,
+    "ssl": false
+  }
 }
